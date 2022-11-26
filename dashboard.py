@@ -9,10 +9,11 @@ from PIL import Image
 import torch.optim as optim
 from architecture import CifarClassifier
 import time
+import torch.distributed as dist
+import torch.nn as nn
 
 
 r_class = {0: 'plane', 1: 'car', 2: 'bird', 3: 'cat', 4: 'deer', 5:'dog', 6:'frog', 7: 'horse', 8:'ship', 9: 'truck'}
-st.markdown("# An example of training Cifar dataset by ML models")
 def get_info():
     data_name = st.sidebar.selectbox("Dataset:", ["cifar-10", "cifar-100"])
     model_name = st.sidebar.selectbox("Model:", ["CNN", "SVM"])
@@ -39,21 +40,31 @@ def parameter_set(model_name):
         params["test_interval"] = test_interval
     return params, finish
 
-def get_batchdata(data_name, params):
+def get_batchdata(data_name, params, rank, world_size):
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     transform = transforms.Compose(
         [transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]) 
     if data_name=="cifar-10":
         cifar10_train = datasets.CIFAR10(root="./dataset", train=True, download=True, transform=transform)
-        test_dataset = datasets.CIFAR10(root="./dataset", train=False, download=True, transform=transform) 
-        train_loader = torch.utils.data.DataLoader(cifar10_train, batch_size=params["batch_size"],shuffle=True)
+        test_dataset = datasets.CIFAR10(root="./dataset", train=False, download=True, transform=transform)
+        if params["distributed"]=="Yes" and device.type!="cpu":
+            train_sampler = torch.utils.data.distributed.DistributedSampler(cifar10_train, num_replicas=world_size, rank=rank)
+            train_loader = torch.utils.data.DataLoader(cifar10_train, batch_size=params["batch_size"],shuffle=False, sampler=train_sampler)
+        else:
+            train_loader = torch.utils.data.DataLoader(cifar10_train, batch_size=params["batch_size"],shuffle=True)
     elif data_name=="cifar-100":
         cifar100_train = datasets.CIFAR100(root="./dataset", train=True, download=True, transform=transform)
-        test_dataset = datasets.CIFAR100(root="./dataset", train=False, download=True, transform=transform)             
-        train_loader = torch.utils.data.DataLoader(cifar100_train, batch_size=params["batch_size"],shuffle=True)
+        test_dataset = datasets.CIFAR100(root="./dataset", train=False, download=True, transform=transform)
+        if params["distributed"]=="Yes" and device.type!="cpu":
+            train_sampler = torch.utils.data.distributed.DistributedSampler(cifar100_train, num_replicas=world_size, rank=rank)
+            train_loader = torch.utils.data.DataLoader(cifar100_train, batch_size=params["batch_size"],shuffle=False, sampler=train_sampler)
+        else:
+            train_loader = torch.utils.data.DataLoader(cifar100_train, batch_size=params["batch_size"],shuffle=True)   
     return train_loader, test_dataset
 
 def show_samples(data_name):
+    st.markdown("# An example of training Cifar dataset by ML models")
     if data_name=="cifar-10":
         train_tmp = datasets.CIFAR10(root="./dataset", train=True, download=True)
     elif data_name=="cifar-100":
@@ -94,7 +105,64 @@ def test(model, test_dataset):
     accuracy = float(acc_num/len(test_dataset))
     # accuracy = float(acc_num/test_num)
     return accuracy
+
+def distributed_train(gpu, args_dict):
+    rank = args_dict["nrank"] * args_dict["gpus"] + gpu
+    word_size = args_dict["nodes"] * args_dict["gpus"]
+    train_loader, test_dataset = get_batchdata(args_dict["data"], args_dict, rank, word_size)
+    dist.init_process_group(backend='nccl', init_method=args_dict["dist_url"], world_size=word_size,
+                            rank=rank)  # Linux
+    torch.manual_seed(0)
+    if args_dict["data"]=="cifar-10":
+        class_num = 10
+    elif args_dict["data"]=="cifar-100":
+        class_num = 100
+    if args_dict["model"]=="CNN":
+        model = CifarClassifier(class_num)
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    torch.cuda.set_device(gpu)
+    model.cuda(gpu)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu],
+                                                    find_unused_parameters=True)
+    lr = args_dict['lr']
+    batch_size = args_dict['batch_size']
+    test_interval = args_dict['test_interval']
+    optim_type = args_dict['optimizer']
+    if optim_type=="Adam":
+        optimizer = optim.Adam(model.parameters(),lr=lr)
+    elif optim_type=="SGD":
+        optimizer = optim.SGD(model.parameters(),lr=lr)
+    elif optim_type=="RMSProp":
+        optimizer = optim.RMSProp(model.parameters(), lr=lr)
+    total_epochs = args_dict['epochs']
+    criterion = torch.nn.CrossEntropyLoss().cuda(gpu)
+    total_num = len(train_loader)*batch_size
+    model.train()
     
+    test_acc = 0.0
+    st.markdown(f"## Start Training...")
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    last_rows = np.array([1.0])
+    chart = st.line_chart(last_rows)
+    for epoch in range(total_epochs):
+        losses = 0
+        for i, (img, label) in enumerate(train_loader):
+            img = img.cuda(gpu)
+            label = label.cuda(gpu)
+            pred = model(img)
+            loss = criterion(pred, label)
+            losses += loss.item()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        train_losses = float(losses/total_num)
+        if epoch%test_interval==0:
+            test_acc = test(model, test_dataset)
+        progress_bar.progress(epoch)
+        status_text.text("Test Accuracy: %s" % test_acc)
+        chart.add_rows(np.array([train_losses]))
+        time.sleep(0.05)
 
 def train(model_name, data_name, train_loader, test_dataset, params):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -104,6 +172,8 @@ def train(model_name, data_name, train_loader, test_dataset, params):
         class_num = 100
     if model_name=="CNN":
         model = CifarClassifier(class_num).to(device)
+    if params["distributed"]=="Yes":
+        model.share_memory()
     lr = params['lr']
     batch_size = params['batch_size']
     test_interval = params['test_interval']
@@ -118,9 +188,8 @@ def train(model_name, data_name, train_loader, test_dataset, params):
     criterion = torch.nn.CrossEntropyLoss()
     total_num = len(train_loader)*batch_size
     model.train()
-    
     test_acc = 0.0
-    st.markdown(f"## Start Training...")
+    st.markdown("## Start Training...")
     progress_bar = st.progress(0)
     status_text = st.empty()
     last_rows = np.array([1.0])
@@ -133,20 +202,15 @@ def train(model_name, data_name, train_loader, test_dataset, params):
             pred = model(img)
             loss = criterion(pred, label)
             losses += loss.item()
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
         train_losses = float(losses/total_num)
+        print(train_losses)
         if epoch%test_interval==0:
             test_acc = test(model, test_dataset)
         progress_bar.progress(epoch)
         status_text.text("Test Accuracy: %s" % test_acc)
         chart.add_rows(np.array([train_losses]))
         time.sleep(0.05)
-
-# data_name, model_name = get_info()
-# params, finish = parameter_set(model_name)
-# show_samples(data_name)
-# if finish=="Yes":
-#     train_loader, test_dataset = get_batchdata(data_name, params)        
-#     train(model_name, data_name, train_loader, test_dataset, params)
             
